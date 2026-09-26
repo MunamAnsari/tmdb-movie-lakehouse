@@ -1,4 +1,4 @@
-import requests, time, json
+import os, requests, time, json
 from datetime import datetime, timezone
 
 API_KEY = os.environ["TMDB_API_KEY"]
