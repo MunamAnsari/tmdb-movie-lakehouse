@@ -1,225 +1,190 @@
 # TMDB Movie Analytics Lakehouse
 
-End-to-end Medallion Architecture (Bronze → Silver → Gold) pipeline built on
-Apache Spark, ingesting movie catalog data from **The Movie Database (TMDB) API**.
+A Databricks and PySpark lakehouse project that ingests movie catalog data from **The Movie Database (TMDB) API** and processes it through Bronze and Silver layers. Gold-layer analytics are future work.
 
 ## Team
-- Munam Ansari 
-- Sanan Zahid 
+
+- Munam Ansari
+- Sanan Zahid
 
 ## Project Domain
-Entertainment / media analytics — tracking movie budgets, revenue, ratings,
-genres, and production companies to answer business questions like
-"which genres deliver the best ROI?" and "how has average movie budget
-changed over the last decade?"
+
+Entertainment and media analytics: movie budgets, revenue, ratings, genres, production companies, cast, keywords, and reviews.
 
 ## Data Source
-- **TMDB API v3** — https://developer.themoviedb.org/reference/intro/getting-started
-- **Full Load:** `/discover/movie` (paginated, sorted by popularity), enriched
-  per-movie with `/movie/{id}?append_to_response=credits,keywords,reviews`
-- **Incremental Load:** `/movie/changes` (returns movie IDs changed in a
-  configurable date window), re-fetched via `/movie/{id}`
 
-## Sample Data & Volume (actual run results)
-- **Full load sample:** 200 movies (10 discover pages), enriched with credits/keywords/reviews
-- **Incremental load sample:** found 35,585 movies changed in the last 7 days;
-  sample capped to the first 300 for repo size, with 2 IDs skipped (deleted
-  between listing and fetch — handled gracefully)
-- At full production scale, a 7-day incremental window returning ~35K changed
-  IDs shows this pipeline needs to handle non-trivial daily volume once deployed
+- **API:** [TMDB API v3](https://developer.themoviedb.org/reference/intro/getting-started)
+- **Full load:** `/discover/movie`, enriched per movie with credits, keywords, and reviews.
+- **Incremental load:** `/movie/changes` over a configurable date window, followed by fetching the changed movie records.
 
-## Repo Structure
+## Repository Structure
+
+```text
+.
 ├── data/
-│ ├── full_load/
-│ └── incremental_load/
+│   ├── full_load/
+│   └── incremental_load/
 ├── scripts/
-│ ├── fetch_full_load.py
-│ ├── fetch_incremental_load.py
-│ └── requirements.txt
+│   ├── fetch_full_load.py
+│   ├── fetch_incremental_load.py
+│   └── requirements.txt
 ├── notebooks/
-│ └── tmdb_data_fetch.ipynb
+│   ├── tmdb_data_fetch.ipynb
+│   ├── phase2_schema_contract_test.ipynb
+│   ├── phase2_raw_to_bronze.ipynb
+│   ├── phase2_bronze_to_silver.ipynb
+│   ├── phase2_silver_child_tables.ipynb
+│   └── phase2_silver_reviews.ipynb
 └── docs/
-└── phase1_proposal.pdf
+    └── phase1_proposal.pdf
+```
 
+Update this tree if the actual committed filenames or folders differ.
 
-## Security & PII Note
-TMDB movie metadata (titles, cast/crew, genres, financials) is public
-catalog data and does not constitute PII. The one exception is the
-`author_username` field inside review sub-resources, which we mask before
-the Silver layer as a precaution. **API keys are never committed** — the
-notebook reads the key from Colab Secrets at runtime rather than storing
-it in code.
+## Implemented Scope
 
-## Medallion Architecture (planned)
-- **Bronze:** Raw JSON as returned by TMDB, partitioned by `load_type` and `ingestion_date`.
-- **Silver:** Flattened genre/cast/keyword arrays, typed columns, deduped on `movie_id`, reviewer usernames masked.
-- **Gold:** Star schema — `fact_movie_performance` joined with `dim_genre`, `dim_production_company`, `dim_date`.
+- **Bronze:** Retains raw movie JSON and ingestion/source metadata in Delta.
+- **Silver:** Parses data using explicit PySpark schemas, validates records, flattens nested collections, and performs Delta `MERGE` operations.
+- **Gold:** Not implemented.
 
-## Infrastructure / FinOps
-Built and tested on **Databricks Community Edition** (free tier). Sample
-sizes capped intentionally (200 full-load records, 300 incremental records)
-to stay well within free compute/storage limits during pipeline testing.
+The Phase 2 notebooks use a `batch_id` parameter to select the Bronze batch to process. Logical keys are validated and used for merges; Delta does not enforce primary-key constraints.
 
-## Phase 2: Bronze and Silver Data Contracts
+## Data Models
 
-These are the planned contracts for the Phase 2 PySpark pipeline. They describe the tables the pipeline will implement; documentation alone does not mean the tables or transformations are already implemented.
+The tables below are in the Databricks namespace `workspace.tmdb_lakehouse`. Types use Spark/Delta SQL notation. All Bronze and Silver tables include `load_timestamp`.
 
-**Planned Databricks namespace:** `workspace.tmdb_lakehouse`  
-The pipeline must confirm that this schema exists and that the user has permission to write to it before creating tables.
+### Bronze
 
-### General contract rules
-
-- Define input schemas explicitly with PySpark `StructType` and `StructField`; do not use Spark schema inference.
-- Every Bronze, Silver, operational, and quarantine table includes a `load_timestamp` (`TimestampType`).
-- Keys below are logical keys enforced by pipeline logic; they are not assumed to be enforced by Databricks.
-- Preserve source lineage using `source_batch_id`, `source_file`, and `source_extracted_at` in Silver tables.
-- Use `source_extracted_at` to select the newest source snapshot. Do not use processing time to decide which snapshot wins, because a backfill processed today may contain older data.
-- Reuse the same `batch_id` and `source_extracted_at` when retrying the same input.
-- Calculate row_hash from stable business fields, excluding load_timestamp and source metadata (source_batch_id, source_file, source_extracted_at). Update only materially changed rows; unchanged rows retain their existing load_timestamp.
-- Keep unreleased movies in Silver with their TMDB `status`. Apply any release-status filtering in a later analytics layer.
-
-### Bronze table
-
-**Table:** `workspace.tmdb_lakehouse.bronze_movie_records`  
+**Table:** `bronze_movie_records`  
 **Grain:** One row per movie per input batch  
 **Logical key:** (`batch_id`, `movie_id`)
 
-| Column | PySpark type | Description |
+| Column | Type | Description |
 |---|---|---|
-| `movie_id` | `LongType` | TMDB movie identifier; required |
-| `load_type` | `StringType` | `full` or `incremental` |
-| `batch_id` | `StringType` | Stable identifier for the input batch; required |
-| `source_file` | `StringType` | Source file path or name |
-| `source_extracted_at` | `TimestampType` | Time represented by the source snapshot |
-| `window_start` | `DateType` | Incremental window start; nullable for full loads |
-| `window_end` | `DateType` | Incremental window end; nullable for full loads |
-| `ingestion_date` | `DateType` | Ingestion date; may be used for partitioning |
-| `load_timestamp` | `TimestampType` | Time this record was first written to Bronze |
-| `raw_payload` | `StringType` | Original JSON for the movie record |
-
-The existing sample files do not provide a reliable per-record extraction timestamp. The pipeline must receive `source_extracted_at` as a run parameter for those files; it must not substitute the current processing time. Bronze ingestion must deduplicate its source on (`batch_id`, `movie_id`) before merging.
+| `batch_id` | STRING | Input batch identifier. |
+| `movie_id` | BIGINT | TMDB movie identifier. |
+| `load_type` | STRING | `full` or `incremental`. |
+| `raw_payload` | STRING | Original movie JSON used for downstream parsing and reprocessing. |
+| `source_file` | STRING | Source file path. |
+| `source_extracted_at` | TIMESTAMP | Source snapshot timestamp used for lineage and ordering. |
+| `window_start` | DATE | Incremental change-window start; NULL for full loads. |
+| `window_end` | DATE | Incremental change-window end; NULL for full loads. |
+| `load_timestamp` | TIMESTAMP | Time the record was written to Bronze. |
 
 ### Silver movie table
 
-**Table:** `workspace.tmdb_lakehouse.silver_movies_cleansed`  
+**Table:** `silver_movies_cleansed`  
 **Grain:** One current cleaned record per movie  
 **Logical key:** `movie_id`
 
-| Column | PySpark type | Description |
+| Column | Type | Description |
 |---|---|---|
-| `movie_id` | `LongType` | TMDB movie identifier; required |
-| `imdb_id` | `StringType` | IMDb identifier |
-| `title` | `StringType` | Movie title; required |
-| `original_title` | `StringType` | Original title |
-| `overview` | `StringType` | Movie description |
-| `original_language` | `StringType` | Original language code |
-| `release_date` | `DateType` | Parsed release date |
-| `runtime` | `IntegerType` | Runtime in minutes |
-| `status` | `StringType` | TMDB status; retain unreleased movies |
-| `adult` | `BooleanType` | Adult-content flag |
-| `video` | `BooleanType` | Video flag |
-| `popularity` | `DoubleType` | TMDB popularity score |
-| `vote_average` | `DoubleType` | Average vote |
-| `vote_count` | `LongType` | Number of votes |
-| `budget` | `LongType` | Budget; zero and negative values become null |
-| `revenue` | `LongType` | Revenue; zero and negative values become null |
-| `profit` | `LongType` | Revenue minus budget, only when both are greater than zero |
-| `roi` | `DoubleType` | (revenue - budget) / budget, only when both are greater than zero |
-| `budget_tier` | `StringType` | `low` below $10M nominal USD; `medium` from $10M to below $100M; `high` at or above $100M; null if budget is unknown |
-| `source_batch_id` | `StringType` | Batch that supplied the current movie state |
-| `source_file` | `StringType` | Source file for lineage |
-| `source_extracted_at` | `TimestampType` | Source snapshot time |
-| `row_hash` | `StringType` | Hash of stable business columns for change detection |
-| `load_timestamp` | `TimestampType` | Time this Silver row was created or materially updated |
-
-TMDB uses zero to represent unknown budget or revenue. The pipeline converts zero and negative amounts to null so unknown revenue is not incorrectly treated as a real loss.
+| `movie_id` | BIGINT | TMDB movie identifier. |
+| `imdb_id` | STRING | IMDb identifier, when available. |
+| `title` | STRING | Movie title. |
+| `original_title` | STRING | Original-language title. |
+| `overview` | STRING | Movie overview. |
+| `original_language` | STRING | Original-language code. |
+| `release_date` | DATE | Parsed date; blank or invalid values become NULL. |
+| `runtime` | INT | Runtime in minutes. |
+| `status` | STRING | TMDB status. |
+| `adult` | BOOLEAN | Adult-content indicator. |
+| `video` | BOOLEAN | Video indicator. |
+| `popularity` | DOUBLE | TMDB popularity value. |
+| `vote_average` | DOUBLE | Average TMDB rating. |
+| `vote_count` | BIGINT | Number of votes. |
+| `budget` | BIGINT | Positive budget; zero or negative values become NULL. |
+| `revenue` | BIGINT | Positive revenue; zero or negative values become NULL. |
+| `profit` | BIGINT | Revenue minus budget when both values are available. |
+| `roi` | DOUBLE | (Revenue - budget) / budget when both values are available. |
+| `budget_tier` | STRING | `low` (< $10M), `medium` ($10M to < $100M), `high` (>= $100M); NULL if budget is unknown. Thresholds are nominal USD. |
+| `source_batch_id` | STRING | Batch that supplied the current movie state. |
+| `source_file` | STRING | Source file path. |
+| `source_extracted_at` | TIMESTAMP | Source snapshot timestamp. |
+| `row_hash` | STRING | SHA-256 hash of business fields for change detection. |
+| `load_timestamp` | TIMESTAMP | Time the Silver row was created or materially updated. |
 
 ### Silver child tables
 
-Each child table has the business columns shown below, plus `source_batch_id StringType`, `source_file StringType`, `source_extracted_at TimestampType`, `row_hash StringType`, and `load_timestamp TimestampType`.
+Each child-table row also has `source_batch_id STRING`, `source_file STRING`, `source_extracted_at TIMESTAMP`, `row_hash STRING`, and `load_timestamp TIMESTAMP`.
 
-| Table | Grain and logical key | Business columns |
+| Table | Grain and logical key | Additional business columns |
 |---|---|---|
-| `silver_movie_genres` | One row per movie–genre; (`movie_id`, `genre_id`) | `movie_id LongType`, `genre_id LongType`, `genre_name StringType` |
-| `silver_movie_studios` | One row per movie–production company; (`movie_id`, `company_id`) | `movie_id LongType`, `company_id LongType`, `company_name StringType`, `origin_country StringType` |
-| `silver_movie_cast` | One row per movie–cast credit; (`movie_id`, `credit_id`) | `movie_id LongType`, `credit_id StringType`, `person_id LongType`, `name StringType`, `character StringType`, `cast_order IntegerType` |
-| `silver_movie_keywords` | One row per movie–keyword; (`movie_id`, `keyword_id`) | `movie_id LongType`, `keyword_id LongType`, `keyword_name StringType` |
+| `silver_movie_genres` | Movie–genre; (`movie_id`, `genre_id`) | `genre_name STRING` |
+| `silver_movie_studios` | Movie–production company; (`movie_id`, `company_id`) | `company_name STRING`, `origin_country STRING` |
+| `silver_movie_cast` | Movie–cast credit; (`movie_id`, `credit_id`) | `person_id BIGINT`, `cast_name STRING`, `character STRING`, `cast_order INT` |
+| `silver_movie_keywords` | Movie–keyword; (`movie_id`, `keyword_id`) | `keyword_name STRING` |
 
-For a successfully processed movie snapshot, each child collection replaces that movie’s previous child set. Remove stale child rows only for movie IDs successfully processed from a complete, valid collection. A valid empty collection means there are no child rows; a missing or malformed collection must not be treated as empty. Apply the replacement only when the incoming source_extracted_at is newer than the stored snapshot, or when processing a retry of the same batch_id. Cast entries missing `credit_id` are quarantined.
+The key columns are BIGINT except `credit_id`, which is STRING. Every child table also includes `movie_id BIGINT` and its other key column (`genre_id`, `company_id`, or `keyword_id`) as BIGINT.
 
 ### Silver reviews table
 
-**Table:** `workspace.tmdb_lakehouse.silver_reviews_cleansed`  
-**Grain:** One row per movie–review  
+**Table:** `silver_movie_reviews`  
+**Grain:** One row per movie review  
 **Logical key:** (`movie_id`, `review_id`)
 
-| Column | PySpark type | Description |
+| Column | Type | Description |
 |---|---|---|
-| `movie_id` | `LongType` | TMDB movie identifier |
-| `review_id` | `StringType` | TMDB review identifier |
-| `reviewer_hash_id` | `StringType` | Salted SHA-256 hash of `author` or `author_details.username` |
-| `rating` | `DoubleType` | Review rating, if provided |
-| `content` | `StringType` | Review text after email and URL scrubbing |
-| `created_at` | `TimestampType` | Review creation time, explicitly parsed from ISO input |
-| `updated_at` | `TimestampType` | Review update time, explicitly parsed from ISO input |
-| `weeks_since_release` | `IntegerType` | Whole seven-day periods between release and review dates; null if either date is missing or review predates release |
-| `source_batch_id` | `StringType` | Source batch |
-| `source_file` | `StringType` | Source file for lineage |
-| `source_extracted_at` | `TimestampType` | Source snapshot time |
-| `row_hash` | `StringType` | Hash of stable review fields for change detection |
-| `load_timestamp` | `TimestampType` | Time this Silver row was created or materially updated |
+| `movie_id` | BIGINT | Parent movie identifier. |
+| `review_id` | STRING | TMDB review identifier. |
+| `reviewer_hash_id` | STRING | Salted SHA-256 hash of reviewer identity; NULL if identity is unavailable. |
+| `content` | STRING | Review text with email addresses and URLs scrubbed. |
+| `created_at` | TIMESTAMP | Review creation time. |
+| `updated_at` | TIMESTAMP | Review update time. |
+| `rating` | DOUBLE | Reviewer rating, when available. |
+| `weeks_since_release` | INT | Floor of elapsed seven-day periods between release and review; NULL if release date is unavailable. |
+| `source_batch_id` | STRING | Source Bronze batch. |
+| `source_file` | STRING | Source file path. |
+| `source_extracted_at` | TIMESTAMP | Source snapshot timestamp. |
+| `row_hash` | STRING | Hash of review business fields. |
+| `load_timestamp` | TIMESTAMP | Silver processing timestamp. |
 
-The salt is stored in a Databricks secret and is never committed to GitHub. Silver does not retain the original username, `author_details.name`, or `avatar_path`. Bronze retains the original payload for traceability and may therefore contain these fields; access to Bronze must be controlled accordingly.
-If both author and author_details.username are missing, set reviewer_hash_id to NULL; do not hash an empty or missing value. Keep the review unless another required field is invalid.
+Raw reviewer names, usernames, avatar paths, and review URLs are not written to Silver. The reviewer hash salt is stored in Databricks Secrets; never commit or print its value.
 
 ### Operational tables
 
-**Execution log table:** `workspace.tmdb_lakehouse.pipeline_execution_logs`  
-**Grain:** One row per pipeline execution  
-**Logical key:** `run_id`
+- **`pipeline_execution_logs`** records one row per execution: `run_id`, `layer`, `load_type`, `input_parameter`, `batch_id`, `start_time`, `end_time`, `status`, `rows_inserted`, `rows_updated`, `rows_quarantined`, `error_details`, and `load_timestamp`.
+- **`pipeline_quarantine`** records rejected-record metadata: `quarantine_id`, `layer`, `batch_id`, `source_file`, `source_extracted_at`, `record_key`, `reason`, `record_hash`, and `quarantined_at`. Raw payloads are not copied into this table.
+- **`silver_child_snapshot_state`** tracks the processed snapshot per `movie_id` and collection using `collection_name`, `source_extracted_at`, `source_batch_id`, and `load_timestamp`.
 
-| Column | PySpark type | Description |
-|---|---|---|
-| `run_id` | `StringType` | Unique identifier for one execution |
-| `layer` | `StringType` | Processing step, such as `Raw-to-Bronze` or `Bronze-to-Silver` |
-| `load_type` | `StringType` | `full` or `incremental` |
-| `input_parameter` | `StringType` | Input path, folder, or backfill parameter |
-| `batch_id` | `StringType` | Input batch identifier |
-| `start_time` | `TimestampType` | Execution start time |
-| `end_time` | `TimestampType` | Execution end time |
-| `status` | `StringType` | `SUCCESS` or `FAILURE` |
-| `rows_inserted` | `LongType` | Number of inserted rows |
-| `rows_updated` | `LongType` | Number of updated rows |
-| `rows_quarantined` | `LongType` | Number of quarantined rows |
-| `error_details` | `StringType` | Failure details; null on success |
-| `load_timestamp` | `TimestampType` | Time the log record was written |
+## Pipeline Behavior
 
-**Quarantine table:** `workspace.tmdb_lakehouse.quarantined_movie_records`  
-**Grain:** One row per rejected record  
-**Logical key:** `quarantine_record_id`
+### Schema enforcement and quarantine
 
-| Column | PySpark type | Description |
-|---|---|---|
-| `quarantine_record_id` | `StringType` | Unique identifier for the quarantine entry |
-| `batch_id` | `StringType` | Source batch |
-| `movie_id` | `LongType` | Movie identifier; nullable if missing or invalid |
-| `source_file` | `StringType` | Source file |
-| `reason` | `StringType` | Validation or parsing failure reason |
-| `raw_payload` | `StringType` | Original record where available |
-| `load_timestamp` | `TimestampType` | Time the record was quarantined |
+- Raw JSON is read and parsed with explicit `StructType` and `StructField` schemas; Spark schema inference is not used.
+- Movie records with invalid required fields are written to quarantine and excluded from Silver. Deterministic quarantine identifiers make retries duplicate-safe.
+- Additive fields not present in the explicit schema remain in the raw Bronze payload and are ignored by the current Silver model.
+- Synthetic testing confirmed an additive field could be parsed without breaking the record, while a non-numeric movie ID was quarantined.
+- Quarantine behavior has been implemented and tested for the movie pipeline. Child and review validation currently stops processing on invalid required fields rather than routing those rows through the movie quarantine flow.
 
-### Run parameters and backfills
+### Idempotency and snapshot handling
 
-Both pipeline steps accept parameters instead of hardcoded “today” paths:
+- Delta `MERGE` operations use the logical keys listed above.
+- Reprocessing the same batch and snapshot does not insert duplicate rows or update unchanged records.
+- Movie snapshots are ordered by `source_extracted_at`; an older snapshot cannot overwrite newer Silver data, and equally timestamped different batches are rejected as ambiguous.
+- A complete, successfully parsed child collection replaces that movie’s stored child set. A valid empty array can remove stale child rows; a missing or unparsed collection is not treated as empty.
+- Reviews use upserts. Rows are not deleted merely because they are absent from a response, since TMDB review results may be paginated.
+- Child stale-row deletions are reported by the notebooks, but the execution-log schema records inserted, updated, and quarantined counts—not a deletion count.
 
-- Input folder or file path
-- `load_type`
-- `batch_id`
-- `source_extracted_at`
-- Optional incremental `window_start` and `window_end`
+## Running Loads and Backfills
 
-A backfill supplies the historical input path and its original source extraction time. Retrying the same input reuses its `batch_id` and `source_extracted_at`.
+1. Run the Raw-to-Bronze notebook with the input path, `load_type`, `batch_id`, `source_extracted_at`, and, for incremental loads, the change-window parameters.
+2. In the movie, child-table, and reviews notebooks, set the `batch_id` widget to the desired Bronze batch.
+3. Run each notebook from the top so it reads and validates the selected batch before merging.
+4. To backfill, select the historical Bronze batch and run the same Silver notebooks. Preserve its source snapshot timestamp; do not replace it with the current processing time.
 
-### Schema drift approach
+The repository’s sample files do not provide reliable real extraction timestamps. For the Phase 2 ordering demonstration only, the full batch was assigned `2026-10-10 00:00:00` and the incremental batch `2026-10-10 00:01:00`. These are simulated test timestamps, not verified TMDB extraction times.
 
-Bronze preserves each original movie JSON record so unrecognized source fields are not lost. The pipeline will test an explicit wrapper schema with `records` declared as `ArrayType(StringType())` against the actual input before relying on it. An explicit movie `StructType` is applied when parsing records for Silver; malformed or non-conforming records are quarantined so a bad record does not fail the whole batch.
+## Validation Evidence
+
+- The full sample contained 200 raw movie records; duplicate handling produced 187 distinct movie records for Bronze/Silver processing.
+- The incremental sample contained 298 Bronze records, including 7 movie IDs also present in the full sample.
+- The incremental movie merge inserted 291 and updated 7 rows, resulting in 478 Silver movie rows.
+- Incremental runs completed successfully for movies, genres, studios, cast, keywords, and reviews.
+- Retrying the same incremental batch produced 0 inserts and 0 updates across those Silver pipelines.
+- Synthetic quarantine testing stored an invalid record once across repeated merges and removed the test row afterward.
+- Synthetic schema-drift testing accepted one additive-field record and quarantined one incompatible-type record. Test rows were removed afterward.
+
+## Infrastructure
+
+Built and tested in a Databricks workspace using PySpark and Delta tables. Sample files are capped for project-scale testing; the incremental API sample was capped at 300 IDs, of which 298 records were fetched and loaded after two unavailable movie records were skipped.
