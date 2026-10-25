@@ -1,3 +1,21 @@
-   .env
-   *.key
-   .ipynb_checkpoints/
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Databricks CLI / local config
+.databricks/
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Stray duplicate downloads
+data/*(2).json
