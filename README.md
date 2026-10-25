@@ -30,6 +30,7 @@ Entertainment and media analytics: movie budgets, revenue, ratings, genres, prod
 │   └── requirements.txt
 ├── notebooks/
 │   ├── tmdb_data_fetch.ipynb
+│   ├── phase2_incremental_autoload.ipynb
 │   ├── phase2_schema_contract_test.ipynb
 │   ├── phase2_raw_to_bronze.ipynb
 │   ├── phase2_bronze_to_silver.ipynb
@@ -173,7 +174,39 @@ Raw reviewer names, usernames, avatar paths, and review URLs are not written to 
 3. Run each notebook from the top so it reads and validates the selected batch before merging.
 4. To backfill, select the historical Bronze batch and run the same Silver notebooks. Preserve its source snapshot timestamp; do not replace it with the current processing time.
 
-The repository’s sample files do not provide reliable real extraction timestamps. For the Phase 2 ordering demonstration only, the full batch was assigned `2026-10-10 00:00:00` and the incremental batch `2026-10-10 00:01:00`. These are simulated test timestamps, not verified TMDB extraction times.
+For a recurring incremental load, skip steps 1–2 and run `phase2_incremental_autoload.ipynb`, described below.
+
+The repository’s sample files do not provide reliable real extraction timestamps. For the Phase 2 ordering demonstration only, the full batch was assigned `2026-10-10 00:00:00` and the incremental batch `2026-10-10 00:01:00`. These are simulated test timestamps, not verified TMDB extraction times. That alignment runs only when the `demo_timestamp_align` widget in `phase2_bronze_to_silver` is set to `true`; it defaults to `false` so scheduled runs never rewrite real snapshot times.
+
+## Automating the Incremental Load
+
+`notebooks/phase2_incremental_autoload.ipynb` replaces the manual Colab-fetch, upload, and Raw-to-Bronze loop. One run calls `/movie/changes`, fetches the changed movie records, writes the wrapped JSON to a Unity Catalog volume, and then invokes `phase2_raw_to_bronze` with the matching widgets.
+
+1. Store the TMDB API key once. It is read from Databricks Secrets and never committed:
+
+   ```powershell
+   databricks secrets create-scope tmdb-lakehouse-secrets
+   databricks secrets put-secret tmdb-lakehouse-secrets tmdb-api-key
+   ```
+
+2. Run the notebook. It creates `workspace.tmdb_lakehouse` and the `raw` volume when they are missing, then loads the batch into Bronze.
+
+   | Widget | Default | Meaning |
+   |---|---|---|
+   | `raw_output_dir` | `/Volumes/workspace/tmdb_lakehouse/raw/incremental` | Base folder; each batch is written to `<dir>/<batch_id>/movies_incremental_load.json`. |
+   | `lookback_days` | `7` | Change window in days; TMDB accepts at most 14. |
+   | `max_movies` | `300` | Upper bound on movies fetched per run. |
+   | `batch_id` | blank → `incremental-YYYYMMDD` | Bronze batch identifier. |
+   | `run_silver` | `false` | Also run the movie, child-table, and review Silver notebooks. |
+   | `api_key` | blank | Optional override for the secret; leave blank in normal use. |
+
+3. To run it on a schedule: **Workflows → Create job → Notebook task**, select this notebook, add a schedule (for example daily at 06:00 UTC), and create. Keep `run_silver=false` when Silver should be reviewed separately.
+
+Behavior notes:
+
+- When the change feed returns no IDs, the notebook exits with `NO_CHANGES:<start>:<end>` before writing a file or merging anything.
+- `source_extracted_at` is the real fetch time, and the default batch ID is date-based, so rerunning the same day reuses the batch and Bronze stays duplicate-safe.
+- Each batch keeps its own raw file, so a historical batch can still be replayed. A custom `raw_output_dir` must point at an existing volume.
 
 ## Validation Evidence
 
