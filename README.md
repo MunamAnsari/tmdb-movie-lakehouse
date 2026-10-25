@@ -1,6 +1,6 @@
 # TMDB Movie Analytics Lakehouse
 
-A Databricks and PySpark lakehouse project that ingests movie catalog data from **The Movie Database (TMDB) API** and processes it through Bronze and Silver layers. Gold-layer analytics are future work.
+A Databricks and PySpark lakehouse project that ingests movie catalog data from **The Movie Database (TMDB) API** and processes it through Bronze, Silver, and Gold layers. Gold is a star schema with conformed dimensions, two fact tables, and bridge tables for the many-to-many relationships.
 
 ## Team
 
@@ -35,24 +35,24 @@ Entertainment and media analytics: movie budgets, revenue, ratings, genres, prod
 │   ├── phase2_raw_to_bronze.ipynb
 │   ├── phase2_bronze_to_silver.ipynb
 │   ├── phase2_silver_child_tables.ipynb
-│   └── phase2_silver_reviews.ipynb
+│   ├── phase2_silver_reviews.ipynb
+│   └── phase3_gold_dimensional.ipynb
 └── docs/
-    └── phase1_proposal.pdf
+    ├── Phase1_Project_Proposal_TMDB_Lakehouse.docx
+    └── gold_dimensional_model.md
 ```
-
-Update this tree if the actual committed filenames or folders differ.
 
 ## Implemented Scope
 
 - **Bronze:** Retains raw movie JSON and ingestion/source metadata in Delta.
 - **Silver:** Parses data using explicit PySpark schemas, validates records, flattens nested collections, and performs Delta `MERGE` operations.
-- **Gold:** Not implemented.
+- **Gold:** Dimensional star schema over Silver: conformed dimensions (`date`, `movie` SCD2, `genre`, `studio`, `person`, `keyword`), bridge tables for the many-to-many links, and two fact tables (`gold_fact_movie_snapshot`, `gold_fact_review`). Built automatically at the end of the incremental pipeline.
 
 The Phase 2 notebooks use a `batch_id` parameter to select the Bronze batch to process. Logical keys are validated and used for merges; Delta does not enforce primary-key constraints.
 
 ## Data Models
 
-The tables below are in the Databricks namespace `workspace.tmdb_lakehouse`. Types use Spark/Delta SQL notation. All Bronze and Silver tables include `load_timestamp`.
+The tables below are in the Databricks namespace `workspace.tmdb_lakehouse`. Types use Spark/Delta SQL notation. All Bronze and Silver tables include `load_timestamp`, as do both Gold facts; Gold dimensions use `valid_from`/`valid_to` for history instead.
 
 ### Bronze
 
@@ -142,9 +142,53 @@ The key columns are BIGINT except `credit_id`, which is STRING. Every child tabl
 
 Raw reviewer names, usernames, avatar paths, and review URLs are not written to Silver. The reviewer hash salt is stored in Databricks Secrets; never commit or print its value.
 
+### Gold
+
+Gold is built by `phase3_gold_dimensional.ipynb`. It does not copy Silver: it conforms entities into surrogate-keyed dimensions, separates descriptive attributes from measures, and records facts at an explicit grain. The full data dictionary is in [`docs/gold_dimensional_model.md`](docs/gold_dimensional_model.md).
+
+| Table | Type | Grain | Keys |
+|---|---|---|---|
+| `gold_dim_date` | dimension | One row per calendar day (1900–2100) | **PK** `date_key` |
+| `gold_dim_movie` | dimension, SCD Type 2 | One row per movie per attribute version | **PK** `movie_key`; natural `movie_id`; **FK** `release_date_key` |
+| `gold_dim_genre` | dimension, SCD Type 1 | One row per genre | **PK** `genre_key`; natural `genre_id` |
+| `gold_dim_studio` | dimension, SCD Type 1 | One row per production company | **PK** `studio_key`; natural `company_id` |
+| `gold_dim_person` | dimension, SCD Type 1 | One row per cast member | **PK** `person_key`; natural `person_id` |
+| `gold_dim_keyword` | dimension, SCD Type 1 | One row per keyword | **PK** `keyword_key`; natural `keyword_id` |
+| `gold_bridge_movie_genre` | bridge | Movie version × genre | **PK/FK** (`movie_key`, `genre_key`) |
+| `gold_bridge_movie_studio` | bridge | Movie version × studio | **PK/FK** (`movie_key`, `studio_key`) |
+| `gold_bridge_movie_cast` | bridge | Movie version × credit | **PK/FK** (`movie_key`, `credit_id`); **FK** `person_key` |
+| `gold_bridge_movie_keyword` | bridge | Movie version × keyword | **PK/FK** (`movie_key`, `keyword_key`) |
+| `gold_fact_movie_snapshot` | fact, periodic snapshot | One row per movie per snapshot date | **PK** `snapshot_key`; **FK** `movie_key`, `snapshot_date_key` |
+| `gold_fact_review` | fact, transaction | One row per review | **PK** `review_key`; **FK** `movie_key`, `review_date_key` |
+
+```mermaid
+erDiagram
+    gold_dim_date ||--o{ gold_dim_movie : "release_date_key"
+    gold_dim_date ||--o{ gold_fact_movie_snapshot : "snapshot_date_key"
+    gold_dim_date ||--o{ gold_fact_review : "review_date_key"
+    gold_dim_movie ||--o{ gold_fact_movie_snapshot : "movie_key"
+    gold_dim_movie ||--o{ gold_fact_review : "movie_key"
+    gold_dim_movie ||--o{ gold_bridge_movie_genre : "movie_key"
+    gold_dim_genre ||--o{ gold_bridge_movie_genre : "genre_key"
+    gold_dim_movie ||--o{ gold_bridge_movie_studio : "movie_key"
+    gold_dim_studio ||--o{ gold_bridge_movie_studio : "studio_key"
+    gold_dim_movie ||--o{ gold_bridge_movie_cast : "movie_key"
+    gold_dim_person ||--o{ gold_bridge_movie_cast : "person_key"
+    gold_dim_movie ||--o{ gold_bridge_movie_keyword : "movie_key"
+    gold_dim_keyword ||--o{ gold_bridge_movie_keyword : "keyword_key"
+```
+
+Modeling notes:
+
+- `gold_dim_movie` is **SCD Type 2** over `title`, `original_title`, `original_language`, `release_date`, `runtime`, `status`, `adult`, and `budget_tier`. Surrogate key `movie_key = xxhash64(movie_id, version)`; `valid_from` / `valid_to` / `is_current` track history, and `attribute_hash` prevents rewriting unchanged rows.
+- Budget, revenue, profit, ROI, votes, popularity, and the child-collection counts are **measures**, so they live in `gold_fact_movie_snapshot`, not on the dimension.
+- The four bridge tables are factless fact tables. A movie has many genres, studios, cast members, and keywords, so those links cannot sit on the movie dimension.
+- `reviewer_hash_id` on `gold_fact_review` is a **degenerate dimension**: the reviewer has no descriptive attributes worth modeling.
+- Delta does not enforce keys. The notebook inner-joins the current dimension version when building facts and bridges, so orphan keys cannot be inserted.
+
 ### Operational tables
 
-- **`pipeline_execution_logs`** records one row per execution: `run_id`, `layer`, `load_type`, `input_parameter`, `batch_id`, `start_time`, `end_time`, `status`, `rows_inserted`, `rows_updated`, `rows_quarantined`, `error_details`, and `load_timestamp`.
+- **`pipeline_execution_logs`** records one row per execution: `run_id`, `layer`, `load_type`, `input_parameter`, `batch_id`, `start_time`, `end_time`, `status`, `rows_inserted`, `rows_updated`, `rows_quarantined`, `error_details`, and `load_timestamp`. Gold appends one row per step with `layer = 'Silver-to-Gold'`; the step name and its source tables are stored in `input_parameter`, and `rows_inserted` + `rows_updated` is the number of aggregated Gold rows produced.
 - **`pipeline_quarantine`** records rejected-record metadata: `quarantine_id`, `layer`, `batch_id`, `source_file`, `source_extracted_at`, `record_key`, `reason`, `record_hash`, and `quarantined_at`. Raw payloads are not copied into this table.
 - **`silver_child_snapshot_state`** tracks the processed snapshot per `movie_id` and collection using `collection_name`, `source_extracted_at`, `source_batch_id`, and `load_timestamp`.
 
@@ -173,8 +217,9 @@ Raw reviewer names, usernames, avatar paths, and review URLs are not written to 
 2. In the movie, child-table, and reviews notebooks, set the `batch_id` widget to the desired Bronze batch.
 3. Run each notebook from the top so it reads and validates the selected batch before merging.
 4. To backfill, select the historical Bronze batch and run the same Silver notebooks. Preserve its source snapshot timestamp; do not replace it with the current processing time.
+5. Run `phase3_gold_dimensional.ipynb` with the same `batch_id` (blank selects the latest Silver batch) to refresh the Gold dimensions and facts.
 
-For a recurring incremental load, skip steps 1–2 and run `phase2_incremental_autoload.ipynb`, described below.
+For a recurring incremental load, skip steps 1–2 and run `phase2_incremental_autoload.ipynb`, described below; it chains Silver and Gold for you.
 
 The repository’s sample files do not provide reliable real extraction timestamps. For the Phase 2 ordering demonstration only, the full batch was assigned `2026-10-10 00:00:00` and the incremental batch `2026-10-10 00:01:00`. These are simulated test timestamps, not verified TMDB extraction times. That alignment runs only when the `demo_timestamp_align` widget in `phase2_bronze_to_silver` is set to `true`; it defaults to `false` so scheduled runs never rewrite real snapshot times.
 
@@ -198,6 +243,7 @@ The repository’s sample files do not provide reliable real extraction timestam
    | `max_movies` | `300` | Upper bound on movies fetched per run. |
    | `batch_id` | blank → `incremental-YYYYMMDD` | Bronze batch identifier. |
    | `run_silver` | `false` | Also run the movie, child-table, and review Silver notebooks. |
+   | `run_gold` | `true` | After Silver, run `phase3_gold_dimensional` to refresh the Gold star schema. Ignored when `run_silver=false`. |
    | `api_key` | blank | Optional override for the secret; leave blank in normal use. |
 
 3. To run it on a schedule: **Workflows → Create job → Notebook task**, select this notebook, add a schedule (for example daily at 06:00 UTC), and create. Keep `run_silver=false` when Silver should be reviewed separately.
@@ -207,6 +253,8 @@ Behavior notes:
 - When the change feed returns no IDs, the notebook exits with `NO_CHANGES:<start>:<end>` before writing a file or merging anything.
 - `source_extracted_at` is the real fetch time, and the default batch ID is date-based, so rerunning the same day reuses the batch and Bronze stays duplicate-safe.
 - Each batch keeps its own raw file, so a historical batch can still be replayed. A custom `raw_output_dir` must point at an existing volume.
+- Gold refreshes automatically at the end of the chain. `gold_dim_movie` is SCD2 (a tracked attribute change closes the old version and opens a new one), the other dimensions are idempotent `MERGE`s, the bridges rebuild the links of current movie versions so upstream removals propagate, and the snapshot fact upserts on `(movie_id, snapshot_date)`, so a same-day rerun updates instead of duplicating.
+- After the load, `phase3_gold_dimensional` runs `OPTIMIZE` on every Gold table. The fact tables and `gold_dim_movie` declare Liquid Clustering; the notebook falls back to plain Delta if the runtime rejects the syntax.
 
 ## Validation Evidence
 
