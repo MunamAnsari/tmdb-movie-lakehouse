@@ -251,6 +251,8 @@ The repository’s sample files do not provide reliable real extraction timestam
 Behavior notes:
 
 - When the change feed returns no IDs, the notebook exits with `NO_CHANGES:<start>:<end>` before writing a file or merging anything.
+- `/movie/changes` is limited to 500 pages (10,000 IDs) and returns HTTP 400 for page 501. The notebook stops paging as soon as `max_movies` unique IDs are collected and prints a warning if it reaches the page ceiling; shorten `lookback_days` when a window is that dense.
+- A v4 read token (JWT, contains two dots) is sent in the `Authorization` header, so it never appears in request URLs or error messages. A v3 key uses the query string, as the API requires.
 - `source_extracted_at` is the real fetch time, and the default batch ID is date-based, so rerunning the same day reuses the batch and Bronze stays duplicate-safe.
 - Each batch keeps its own raw file, so a historical batch can still be replayed. A custom `raw_output_dir` must point at an existing volume.
 - Gold refreshes automatically at the end of the chain. `gold_dim_movie` is SCD2 (a tracked attribute change closes the old version and opens a new one), the other dimensions are idempotent `MERGE`s, the bridges rebuild the links of current movie versions so upstream removals propagate, and the snapshot fact upserts on `(movie_id, snapshot_date)`, so a same-day rerun updates instead of duplicating.
